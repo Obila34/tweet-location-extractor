@@ -12,9 +12,43 @@ from utils import set_global_seed
 
 
 RELATIVE_HINT_RE = re.compile(
-    r"\b(km|meter|meters|miles?|near|around|north|south|east|west|from)\b",
+    r"\b(km|meter|meters|miles?|near|around|north|south|east|west|from|away|towards?)\b",
     re.IGNORECASE,
 )
+
+# Short words that are frequently hallucinated as locations by generic NER models.
+NOISE_WORDS = {
+    "in",
+    "or",
+    "and",
+    "the",
+    "a",
+    "an",
+    "of",
+    "to",
+    "for",
+    "on",
+    "at",
+    "by",
+    "with",
+    "from",
+    "near",
+    "new",
+    "red",
+    "wildfire",
+    "flood",
+    "storm",
+    "disaster",
+    "pic",
+    "ni",
+    "ne",
+    "pr",
+    "sa",
+    "cal",
+}
+
+# Keep only a tiny set of short uppercase geo abbreviations to improve precision.
+ALLOWED_SHORT = {"US", "USA", "UK", "UAE", "EU", "NYC"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -40,28 +74,54 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model-name",
         type=str,
-        default="Babelscape/wikineural-multilingual-ner",
+        default="dslim/bert-base-NER",
         help="HF token-classification model.",
     )
     parser.add_argument("--batch-size", type=int, default=32, help="Inference batch size.")
+    parser.add_argument("--min-score", type=float, default=0.80, help="Minimum entity confidence.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     return parser.parse_args()
 
 
 def normalize_entity_text(text: str) -> str:
     # Normalize spacing and strip punctuation fragments from entity boundaries.
-    text = re.sub(r"\s+", " ", text).strip(" ,.;:!?()[]{}\"'")
-    return text
+    return re.sub(r"\s+", " ", text).strip(" ,.;:!?()[]{}\"'`“”’")
+
+
+def _is_title_or_upper(word: str) -> bool:
+    return bool(re.match(r"^[A-Z][a-z]+$", word) or re.match(r"^[A-Z]{2,}$", word))
 
 
 def keep_entity(candidate: str) -> bool:
+    candidate = normalize_entity_text(candidate)
     if not candidate:
         return False
-    # Drop address-like candidates and unit-bearing fragments.
+
     if any(ch.isdigit() for ch in candidate):
         return False
     if RELATIVE_HINT_RE.search(candidate):
         return False
+
+    lc = candidate.lower()
+    if lc in NOISE_WORDS:
+        return False
+
+    words = [w for w in re.split(r"\s+", candidate) if w]
+    if not words:
+        return False
+
+    # Reject tiny tokens unless they are in a small explicit whitelist.
+    if len(candidate) <= 3 and candidate.upper() not in ALLOWED_SHORT:
+        return False
+
+    # Reject all-lowercase single words; true places are usually proper nouns.
+    if len(words) == 1 and words[0].islower():
+        return False
+
+    # Require at least one token to look like a proper noun or uppercase abbreviation.
+    if not any(_is_title_or_upper(w) for w in words):
+        return False
+
     return True
 
 
@@ -73,7 +133,6 @@ def build_lexicon(train_file: Path) -> List[str]:
     if "location" not in df.columns:
         return []
 
-    # Treat each full label string as a candidate place phrase.
     phrases = (
         df["location"]
         .fillna("")
@@ -84,9 +143,10 @@ def build_lexicon(train_file: Path) -> List[str]:
         .tolist()
     )
 
-    # Longest-first matching avoids splitting multi-token place names.
-    phrases.sort(key=len, reverse=True)
-    return phrases
+    # Filter low-quality phrases from training labels to prevent noisy matching.
+    filtered = [p for p in phrases if keep_entity(p)]
+    filtered.sort(key=len, reverse=True)
+    return filtered
 
 
 def find_lexicon_matches(text: str, lexicon: List[str]) -> List[Tuple[int, int, str]]:
@@ -99,8 +159,14 @@ def find_lexicon_matches(text: str, lexicon: List[str]) -> List[Tuple[int, int, 
             idx = lower.find(p, start)
             if idx == -1:
                 break
+
+            # Simple token-boundary guard to reduce substring false matches.
+            left_ok = idx == 0 or not text[idx - 1].isalnum()
             end = idx + len(phrase)
-            matches.append((idx, end, text[idx:end]))
+            right_ok = end == len(text) or not text[end].isalnum()
+            if left_ok and right_ok:
+                matches.append((idx, end, text[idx:end]))
+
             start = end
     return matches
 
@@ -127,8 +193,7 @@ def merge_spans(spans: List[Tuple[int, int, str]]) -> List[str]:
             ordered_entities.append(txt)
 
     # Remove duplicates while preserving first appearance order.
-    deduped = list(dict.fromkeys(ordered_entities))
-    return deduped
+    return list(dict.fromkeys(ordered_entities))
 
 
 def main() -> None:
@@ -172,12 +237,18 @@ def main() -> None:
             spans: List[Tuple[int, int, str]] = []
 
             for ent in entities:
-                label = ent.get("entity_group", "")
-                if label.upper() not in {"LOC", "LOCATION"}:
+                label = str(ent.get("entity_group", "")).upper()
+                if label not in {"LOC", "LOCATION", "GPE"}:
                     continue
+
+                score = float(ent.get("score", 0.0))
+                if score < args.min_score:
+                    continue
+
                 start = int(ent.get("start", -1))
                 end = int(ent.get("end", -1))
                 word = str(ent.get("word", ""))
+
                 if start >= 0 and end > start:
                     spans.append((start, end, text[start:end]))
                 elif word:
