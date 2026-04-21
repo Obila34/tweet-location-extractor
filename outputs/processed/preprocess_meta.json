@@ -1,0 +1,31 @@
+{
+  "seed": 42,
+  "input": {
+    "train": "DATA/Train_1.csv",
+    "test": "DATA/Test.csv"
+  },
+  "rows": {
+    "train": 73072,
+    "test": 2942
+  },
+  "columns": {
+    "train_inferred": {
+      "id": "tweet_id",
+      "text": "text",
+      "location": "location"
+    },
+    "test_inferred": {
+      "id": "tweet_id",
+      "text": "text"
+    },
+    "train_output": [
+      "tweet_id",
+      "text",
+      "location"
+    ],
+    "test_output": [
+      "tweet_id",
+      "text"
+    ]
+  }
+}
